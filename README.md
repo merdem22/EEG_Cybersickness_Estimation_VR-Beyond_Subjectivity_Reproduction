@@ -2,6 +2,10 @@
 
 This repository provides the framework and scripts for processing, training, and evaluating models related to the VR Cybersickness EEG dataset. The codebase is designed to handle different input modalities, train neural networks, and evaluate performance for classification or regression tasks.
 
+## Dataset Download
+
+You can download the dataset from [this Google Drive folder](https://drive.google.com/drive/folders/1ijWfyNYktqKV0ACpgCNOLuhJf8YsWYfB).
+
 ## Features
 - **Modular Design**: Supports various input types (e.g., kinematic, power-spectral-difference).
 - **Flexible Task Selection**: Allows for both classification and regression tasks.
