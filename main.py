@@ -8,6 +8,8 @@ import random
 import argparse
 from torchvision.models import get_model
 from trainer import MyTrainerModel
+
+
 from torchutils.trainer import Trainer
 from torchutils.callbacks import AverageScoreLogger
 from torchutils.callbacks import EarlyStopping
@@ -47,7 +49,7 @@ if __name__ == '__main__':
     params.patient = f'{params.patient:04d}'
     set_seed(params.seed)
 
-    train_dataset, valid_dataset, test_datasets = loader.load_train_test_datasets(patient=params.patient, input_type=params.input_type, task=params.task, validation=True)
+    train_dataset, valid_dataset, test_datasets = loader.load_train_test_datasets(prefix="datasets/.cache", patient=params.patient, input_type=params.input_type, task=params.task, validation=True)
     device='cpu' if params.no_cuda else 'cuda'
 
     net = MyTrainerModel(

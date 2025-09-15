@@ -7,6 +7,16 @@ from helpers import to_numpy_input_tensors, detach_input_tensors, to_cpu_input_t
 from torchutils.metrics import AverageScore
 from metrics import leaky_accuracy
 
+import torch.nn as nn
+
+class _LambdaLoss(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def forward(self, preds, targs):
+        # keep your flattening behavior
+        return self.fn(preds.flatten(), targs.flatten())
+
 
 class MyTrainerModel(TrainerModel):
     def __init__(self, train_joy_mean, input_type, task, **kwds):
@@ -27,7 +37,7 @@ class MyTrainerModel(TrainerModel):
         super().__init__(**kwds, writable_scores=writable_scores)
         if task == 'regression':
             fn = self.criterion
-            self.criterion = lambda preds, targs: fn(preds.flatten(), targs.flatten())
+            self.criterion = _LambdaLoss(fn)
             writable_scores.add(self.criterion_name)
         self._buffer['getter_keys'] = ('eeg', 'psd', 'kinematic') if input_type == 'multi-segment' else ('kinematic',)
         self._buffer['lr'] = AverageScore(name='lr')

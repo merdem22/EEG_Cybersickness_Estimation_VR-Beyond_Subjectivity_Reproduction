@@ -4,6 +4,5 @@ save/
 *.png
 logs0old/
 analysis/**/*.png
-torchutils
 tests/**/*.logs
 __pycache__/
