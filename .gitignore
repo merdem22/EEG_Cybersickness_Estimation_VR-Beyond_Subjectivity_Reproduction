@@ -6,5 +6,6 @@ logs0old/
 analysis/**/*.png
 tests/**/*.logs
 __pycache__/
-
+.venv
+data
 
