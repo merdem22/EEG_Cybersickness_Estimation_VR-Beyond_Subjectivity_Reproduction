@@ -15,7 +15,6 @@ class AverageScore:
         try:
             v = float(value)
         except Exception:
-            # Ignore non-numeric updates silently.
             return
         self.total += v * n
         self.count += n
