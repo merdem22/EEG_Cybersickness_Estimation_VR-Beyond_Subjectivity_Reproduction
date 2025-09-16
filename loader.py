@@ -40,7 +40,7 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
-def load_train_test_datasets(prefix='/datasets/.cache', patient='0001', task='regression', input_type='multi-segment', validation=False):
+def load_train_test_datasets(prefix='datasets/.cache', patient='0001', task='regression', input_type='power-spectral-no-kinematic', validation=False):
     assert isinstance(task, str) and task in ['classification', 'regression']
     assert isinstance(input_type, str) #and input_type in ['multi-segment', 'kinematic', 'power-spectral-coeff', 'power-spectral-difference']
     assert isinstance(patient, str) and len(patient) == 4

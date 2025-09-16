@@ -1,134 +1,184 @@
-# torchutils/trainer.py
+
+from __future__ import annotations
+import logging
+from typing import Iterable, Optional, Dict, Any, List, Union
 import torch
 from torch.utils.data import DataLoader
+from .callbacks import Callback, EarlyStopping, AverageScoreLogger
 
 class Trainer:
-    def __init__(self, model, train_dataset=None, valid_dataset=None,
-                 train_dataloader_kwargs=None, valid_dataloader_kwargs=None):
+    """A minimal training/eval loop compatible with the provided repo style.
+
+    It expects a `model` that extends `torchutils.models.TrainerModel` and
+    provides:
+      - forward(batch): returns a loss tensor or predictions; should update model._loss (AverageScore)
+      - forward_pass_on_evauluation_step(batch): like forward but for eval
+      - writable_scores(): set/list of score names (e.g., {'loss', 'accuracy', 'mse_loss', ...})
+    """
+    def __init__(self, model, net: Optional[torch.nn.Module] = None,
+                 optimizer: Optional[torch.optim.Optimizer] = None,
+                 device: Optional[Union[str, torch.device]] = None,
+                 logger: Optional[logging.Logger] = None):
         self.model = model
-        self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
-        self.train_dataloader_kwargs = train_dataloader_kwargs or {}
-        self.valid_dataloader_kwargs = valid_dataloader_kwargs or {}
+        self.logger = logger or logging.getLogger('torchutils.trainer')
+        self.logger.propagate = False  # we manage handlers
+        self._handlers_added = False
 
-        # build optimizer
-        params = [p for p in model.parameters() if p.requires_grad]
-        self.optim = torch.optim.Adam(params, lr=1e-3)
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
 
-        # give the model a handle (your model reads self.optimizer.param_groups)
-        self.model.optimizer = self.optim
-        # also keep a synonym for convenience (some code expects .optimizer on Trainer too)
-        self.optimizer = self.optim
+        if net is not None:
+            self.model.set_network(net)
+        if optimizer is not None:
+            self.model.set_optimizer(optimizer)
+        self.model.set_device(self.device)
+        self.model.set_logger(self.logger)
 
-        self.history = []
+    def compile(self, handlers: Optional[List[logging.Handler]] = None):
+        # Attach logging handlers (console/file) if provided.
+        if handlers and not self._handlers_added:
+            for h in handlers:
+                self.logger.addHandler(h)
+            self._handlers_added = True
 
-    def compile(self, handlers=None):
-        return self
+    # ----- internal helpers -----
+    def _make_loader(self, dataset, dataloader_kwargs: Optional[Dict[str, Any]]):
+        if dataloader_kwargs is None:
+            dataloader_kwargs = {}
+        if 'batch_size' not in dataloader_kwargs:
+            dataloader_kwargs['batch_size'] = 32
+        if 'shuffle' not in dataloader_kwargs:
+            dataloader_kwargs['shuffle'] = True
+        return DataLoader(dataset, **dataloader_kwargs)
 
-    def _make_loader(self, dataset, batch_size, for_train=True, extra_kwargs=None):
-        if dataset is None:
-            return None
-        kw = dict(batch_size=batch_size, shuffle=for_train, drop_last=False)
-        if isinstance(extra_kwargs, dict):
-            kw.update(extra_kwargs)
-        return DataLoader(dataset, **kw)
+    def _compute_loss_from_output(self, output, batch) -> Optional[torch.Tensor]:
+        """Best-effort way to derive a loss tensor from model output.
 
-    def _to_device(self, batch, device):
-        if isinstance(batch, dict):
-            out = {}
-            for k, v in batch.items():
+        - If `output` is a scalar tensor, return it.
+        - If it's a dict with 'loss', return that.
+        - If it's a list/tuple of predictions and batch has targets under 'observation',
+          try to average self.model.criterion(pred, targ) over items.
+        """
+        if isinstance(output, torch.Tensor):
+            if output.ndim == 0 or output.size() == torch.Size([]):
+                return output
+        if isinstance(output, dict) and 'loss' in output and isinstance(output['loss'], torch.Tensor):
+            return output['loss']
+        if isinstance(output, (list, tuple)) and 'observation' in batch and hasattr(self.model, 'criterion'):
+            try:
+                losses = []
+                for pred, targ in zip(output, batch['observation']):
+                    losses.append(self.model.criterion(pred, targ))
+                if losses:
+                    return torch.stack(losses).mean()
+            except Exception:
+                return None
+        return None
+
+    def fit(self, train_dataset, valid_dataset=None, num_epochs: int = 1,
+            callbacks: Optional[List[Callback]] = None,
+            dataloader_kwargs: Optional[Dict[str, Any]] = None,
+            val_dataloader_kwargs: Optional[Dict[str, Any]] = None):
+        callbacks = callbacks or []
+        train_loader = self._make_loader(train_dataset, dataloader_kwargs)
+        val_loader = self._make_loader(valid_dataset, val_dataloader_kwargs) if valid_dataset is not None else None
+
+        model = self.model
+        net = model.net()
+        opt = model.optimizer()
+
+        for epoch in range(1, num_epochs + 1):
+            model._loss.reset()
+            if hasattr(model, '_buffer') and isinstance(model._buffer, dict):
+                # optionally reset epoch-specific buffers if subclass uses them
+                model._buffer.setdefault('epoch', epoch)
+            if net is not None:
+                net.train()
+
+            for step, batch in enumerate(train_loader):
+                # Move tensors to device if possible
                 try:
-                    out[k] = v.to(device)
+                    batch = {k: (v.to(self.device) if hasattr(v, 'to') else v) for k, v in batch.items()}
                 except Exception:
-                    out[k] = v
-            return out
-        return batch
+                    pass
 
-    def train(self, num_epochs=1, batch_size=32, callbacks=None, num_epochs_per_validation=1):
-        callbacks = callbacks or []
-        device = getattr(self.model, 'device', 'cpu')
-        train_loader = self._make_loader(self.train_dataset, batch_size, for_train=True,
-                                         extra_kwargs=self.train_dataloader_kwargs)
-        valid_loader = self._make_loader(self.valid_dataset, batch_size, for_train=False,
-                                         extra_kwargs=self.valid_dataloader_kwargs)
+                out = model.forward(batch)
+                loss = self._compute_loss_from_output(out, batch)
+                if loss is None:
+                    # Allow subclasses to set ._last_loss
+                    loss = getattr(model, '_last_loss', None)
+                if loss is None:
+                    raise RuntimeError("Model.forward didn't return a loss tensor and no fallback was possible.")
 
-        for epoch in range(num_epochs):
-            self.model.train()
-            if hasattr(self.model, 'begin_epoch'):
-                self.model.begin_epoch()
-
-            for batch_idx, batch in enumerate(train_loader):
-                batch = self._to_device(batch, device)
-
-                # allow model to return (preds, loss) or just preds
-                out = self.model.forward(batch, batch_idx=batch_idx)
-                if isinstance(out, tuple) and len(out) == 2:
-                    preds, loss = out
-                else:
-                    preds = out
-                    loss = self.model.criterion(preds, batch['observation'])
-
-                self.optim.zero_grad(set_to_none=True)
+                opt.zero_grad(set_to_none=True)
                 loss.backward()
-                self.optim.step()
+                opt.step()
 
-                # keep running average in model._loss if present
-                if hasattr(self.model, '_loss'):
-                    try:
-                        n = batch['observation'].shape[0]
-                    except Exception:
-                        n = 1
-                    self.model._loss.update(float(loss.item()), n=n)
-
-            # validation step
-            if valid_loader is not None and (epoch + 1) % max(1, num_epochs_per_validation) == 0:
-                self.model.eval()
+            # ---- end epoch: compute training logs ----
+            train_logs = {'loss': model._loss.avg}
+            # Validation
+            val_logs = {}
+            if val_loader is not None:
+                if net is not None:
+                    net.eval()
+                model._loss.reset()
                 with torch.no_grad():
-                    if hasattr(self.model, 'begin_epoch'):
-                        self.model.begin_epoch()
-                    for batch_idx, batch in enumerate(valid_loader):
-                        batch = self._to_device(batch, device)
-                        if hasattr(self.model, 'forward_pass_on_evauluation_step'):
-                            _ = self.model.forward_pass_on_evauluation_step(batch, batch_idx=batch_idx)
+                    for vstep, vbatch in enumerate(val_loader):
+                        try:
+                            vbatch = {k: (v.to(self.device) if hasattr(v, 'to') else v) for k, v in vbatch.items()}
+                        except Exception:
+                            pass
+                        # Use eval-specific forward if available
+                        if hasattr(model, 'forward_pass_on_evauluation_step'):
+                            _ = model.forward_pass_on_evauluation_step(vbatch)
                         else:
-                            out = self.model.forward(batch, batch_idx=batch_idx)
-                            if isinstance(out, tuple) and len(out) == 2:
-                                preds, loss = out
-                            else:
-                                preds = out
-                                loss = self.model.criterion(preds, batch['observation'])
-                            if hasattr(self.model, '_loss'):
-                                self.model._loss.update(float(loss.item()))
+                            _ = model.forward(vbatch)
+                val_logs['val_loss'] = model._loss.avg
 
-            metrics = self.model.end_epoch_metrics() if hasattr(self.model, 'end_epoch_metrics') else {}
-            self.history.append(metrics)
+            # Merge logs
+            logs = {**train_logs, **val_logs}
+
+            # Callbacks
+            stop = False
             for cb in callbacks:
+                # Provide logger and trainer to callbacks
                 if hasattr(cb, 'on_epoch_end'):
-                    cb.on_epoch_end(self, metrics)
-                elif callable(cb):
-                    cb(self, metrics)
-                if getattr(cb, 'should_stop', False):
-                    return
+                    res = cb.on_epoch_end(epoch, logs=logs, logger=self.logger, trainer=self)
+                    # EarlyStopping returns True to stop
+                    if res is True:
+                        stop = True
+            if stop:
+                break
 
-    def predict(self, dataset, callbacks=None, dataloader_kwargs=None):
+    def predict(self, dataset, callbacks: Optional[List[Callback]] = None,
+                dataloader_kwargs: Optional[Dict[str, Any]] = None):
         callbacks = callbacks or []
-        device = getattr(self.model, 'device', 'cpu')
-        loader = self._make_loader(dataset,
-                                   batch_size=(dataloader_kwargs or {}).get('batch_size', 32),
-                                   for_train=False,
-                                   extra_kwargs=dataloader_kwargs or {})
-        self.model.eval()
+        loader = self._make_loader(dataset, dataloader_kwargs or {'batch_size': 64, 'shuffle': False})
+        model = self.model
+        net = model.net()
+        if net is not None:
+            net.eval()
+
+        preds = []
+        import torch
         with torch.no_grad():
-            if hasattr(self.model, 'begin_epoch'):
-                self.model.begin_epoch()
-            for batch_idx, batch in enumerate(loader):
-                batch = self._to_device(batch, device)
-                if hasattr(self.model, 'forward_pass_on_evauluation_step'):
-                    _ = self.model.forward_pass_on_evauluation_step(batch, batch_idx=batch_idx)
+            for batch in loader:
+                try:
+                    batch = {k: (v.to(self.device) if hasattr(v, 'to') else v) for k, v in batch.items()}
+                except Exception:
+                    pass
+                if hasattr(model, 'forward_pass_on_evauluation_step'):
+                    out = model.forward_pass_on_evauluation_step(batch)
                 else:
-                    _ = self.model.forward(batch, batch_idx=batch_idx)
-        metrics = self.model.end_epoch_metrics() if hasattr(self.model, 'end_epoch_metrics') else {}
+                    out = model.forward(batch)
+                preds.append(out)
+
+        # Aggregate and call callbacks (best-effort)
+        logs = {'loss': model._loss.avg}
         for cb in callbacks:
-            if hasattr(cb, 'on_predict_end'): cb.on_predict_end(self, metrics)
-            elif hasattr(cb, 'on_epoch_end'): cb.on_epoch_end(self, metrics)
-            elif callable(cb): cb(self, metrics)
+            if hasattr(cb, 'on_predict_end'):
+                cb.on_predict_end(logs=logs, logger=self.logger)
+        return preds

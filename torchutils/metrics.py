@@ -1,20 +1,30 @@
-# torchutils/metrics.py
+
+from __future__ import annotations
+
 class AverageScore:
-    def __init__(self, name=None, **kwargs):
+    """Keeps a running average of a scalar metric."""
+    def __init__(self, name: str = "score"):
         self.name = name
         self.reset()
+
     def reset(self):
-        self.sum = 0.0
+        self.total = 0.0
         self.count = 0
-    def update(self, value, n: int = 1):
+
+    def update(self, value: float, n: int = 1):
         try:
             v = float(value)
         except Exception:
-            v = 0.0
-        self.sum += v * n
+            # Ignore non-numeric updates silently.
+            return
+        self.total += v * n
         self.count += n
+
     @property
-    def value(self):
-        return self.sum / max(self.count, 1)
-    def __float__(self):
-        return self.value
+    def avg(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total / self.count
+
+    def __repr__(self):
+        return f"AverageScore(name={self.name!r}, avg={self.avg:.6f}, count={self.count})"
