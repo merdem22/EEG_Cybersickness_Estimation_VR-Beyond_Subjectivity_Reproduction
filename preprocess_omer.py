@@ -209,8 +209,9 @@ def extract_windows_with_labels(participant_path,
                 break
 
             # label at END of window (segment-wise, like repo)
+            raw_label = float(matched_cs[e - 1])
             if task == "regression":
-                cs_label = float(progress[e - 1])
+                cs_label = raw_label
             else:  # classification
                 cs_label = float(event[e - 1])
 
@@ -230,6 +231,9 @@ def extract_windows_with_labels(participant_path,
     eeg_windows = np.stack(all_eeg_windows, axis=0)      # (N, C, T) with T=target_len
     cs_labels   = np.asarray(all_cs_labels, dtype=float) # (N,)
     participant_ids = np.full(len(all_eeg_windows), participant_id)
+
+
+
     return eeg_windows, cs_labels, participant_ids
 
 
