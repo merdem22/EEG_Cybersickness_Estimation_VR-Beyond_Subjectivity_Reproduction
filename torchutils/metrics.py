@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 class AverageScore:
-    """Keeps a running average of a scalar metric."""
     def __init__(self, name: str = "score"):
         self.name = name
         self.reset()

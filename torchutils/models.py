@@ -29,42 +29,29 @@ _SCHEDULERS = {
 }
 
 class TrainerModel:
-    """Base wrapper expected by the training loop.
-
-    Subclasses typically call super().__init__(**kwds, writable_scores={...}).
-    Accepts many kwargs but only uses a few common ones; the rest are stored
-    in self._buffer for subclass access.
-
-    Known kwargs:
-      - model (str): name registered via torchvision.register_model (e.g., 'power-spectral-no-kinematic-model')
-      - n_channels, hidden_size, num_classes: forwarded to get_model(...)
-      - optimizer (str), lr (float), weight_decay (float)
-      - criterion (str): one of _LOSSES keys
-      - scheduler (str) + optional scheduler_* params
-      - device (torch.device or str)
-      - writable_scores (set/list of str)
-    """
     def __init__(self, **kwargs):
         self._net = None
+        self.model = None  # alias used by repo
         self._optimizer = None
+        self.optimizer = None  # alias used by repo
         self._scheduler = None
         self._device = torch.device('cpu')
+        self.device_attr = self._device  # exposed alias
         self._logger = None
         self._loss = AverageScore('loss')
         self._buffer: Dict[str, Any] = {}
 
-        # 1) Device
+        # Device
         device = kwargs.pop('device', None)
         if device is not None:
             self.set_device(torch.device(device) if isinstance(device, str) else device)
 
-        # 2) Network
+        # Network
         model_name = kwargs.pop('model', None)
         n_channels = kwargs.pop('n_channels', None)
         hidden_size = kwargs.pop('hidden_size', None)
         num_classes = kwargs.pop('num_classes', None)
         if model_name is not None:
-            # Forward typical init kwargs; ignore if None
             model_kwargs = {}
             if n_channels is not None: model_kwargs['n_channels'] = n_channels
             if hidden_size is not None: model_kwargs['hidden_size'] = hidden_size
@@ -72,14 +59,13 @@ class TrainerModel:
             try:
                 net = get_model(model_name, **model_kwargs)
             except Exception:
-                # Fallback: user may have passed a torch.nn.Module directly via 'model_obj'
                 net = kwargs.pop('model_obj', None)
             if net is not None:
                 self.set_network(net)
                 if self._device is not None:
                     self._net.to(self._device)
 
-        # 3) Optimizer
+        # Optimizer
         opt_name = kwargs.pop('optimizer', None)
         lr = float(kwargs.pop('lr', 1e-3))
         weight_decay = float(kwargs.pop('weight_decay', 0.0))
@@ -89,7 +75,7 @@ class TrainerModel:
                 raise ValueError(f"Unknown optimizer '{opt_name}'. Available: {list(_OPTIMIZERS.keys())}")
             self.set_optimizer(opt_cls(self._net.parameters(), lr=lr, weight_decay=weight_decay))
 
-        # 4) Criterion
+        # Criterion
         crit_name = kwargs.pop('criterion', None)
         if isinstance(crit_name, str):
             if crit_name not in _LOSSES:
@@ -97,17 +83,15 @@ class TrainerModel:
             self.criterion = _LOSSES[crit_name]
             self.criterion_name = crit_name
         else:
-            # Allow subclass to set criterion later
             self.criterion = getattr(self, 'criterion', lambda x, y: F.mse_loss(x, y))
             self.criterion_name = getattr(self, 'criterion_name', 'mse_loss')
 
-        # 5) Scheduler (optional)
+        # Scheduler
         sch_name = kwargs.pop('scheduler', None)
         if sch_name and self._optimizer is not None:
             sch_cls = _SCHEDULERS.get(sch_name, None)
             if sch_cls is None:
                 raise ValueError(f"Unknown scheduler '{sch_name}'. Available: {list(_SCHEDULERS.keys())}")
-            # Common kwargs
             if sch_name == 'ReduceLROnPlateau':
                 patience = int(kwargs.pop('scheduler_patience', 5))
                 factor = float(kwargs.pop('scheduler_factor', 0.5))
@@ -124,31 +108,36 @@ class TrainerModel:
                 gamma = float(kwargs.pop('scheduler_gamma', 0.95))
                 self._scheduler = sch_cls(self._optimizer, gamma=gamma)
 
-        # 6) Writable scores (for callbacks)
         writable_scores = kwargs.pop('writable_scores', None)
         if writable_scores is not None:
             self._buffer['writable_scores'] = set(writable_scores)
 
-        # 7) Stash any remaining kwargs in buffer so subclasses can read them
+        # Stash remaining kwargs for subclass
         for k, v in kwargs.items():
             self._buffer[k] = v
 
-    # ----- Wiring -----
+    # Wiring
     def set_network(self, net: torch.nn.Module):
         self._net = net
+        # alias expected by repo subclasses
+        self.model = net
 
     def set_optimizer(self, opt: torch.optim.Optimizer):
         self._optimizer = opt
+        # alias expected by repo subclasses
+        self.optimizer = opt
 
     def set_device(self, device: torch.device):
         self._device = device
+        # expose attribute as well (repo sometimes reads model.device)
+        self.device_attr = device
         if self._net is not None:
             self._net.to(device)
 
     def set_logger(self, logger):
         self._logger = logger
 
-    # ----- Convenience -----
+    # Convenience
     def net(self) -> torch.nn.Module:
         return self._net
 
@@ -165,12 +154,42 @@ class TrainerModel:
         if self._logger is not None:
             self._logger.log(level, msg)
 
-    # Subclasses should override these.
     def forward(self, batch: Dict[str, Any]):
         raise NotImplementedError
 
     def forward_pass_on_evauluation_step(self, batch: Dict[str, Any]):
         return self.forward(batch)
+
+
+    # ----- Metrics aggregation helpers -----
+    def _ensure_scores_dict(self):
+        if '_scores' not in self._buffer or not isinstance(self._buffer.get('_scores'), dict):
+            self._buffer['_scores'] = {}
+
+    def log_score(self, name: str, value: float, n: int = 1):
+        """Aggregate arbitrary metrics (e.g., 'mse_loss', 'mean/l1_loss')."""
+        self._ensure_scores_dict()
+        scores = self._buffer['_scores']
+        if name not in scores:
+            scores[name] = AverageScore(name=name)
+        try:
+            scores[name].update(float(value), n=n)
+        except Exception:
+            pass
+
+    def reset_scores(self):
+        self._buffer['_scores'] = {}
+
+    def get_logged_scores(self):
+        """Return dict of {metric_name: avg} for all aggregated metrics."""
+        self._ensure_scores_dict()
+        out = {}
+        for k, v in self._buffer['_scores'].items():
+            try:
+                out[k] = float(v.avg)
+            except Exception:
+                continue
+        return out
 
     def writable_scores(self):
         return self._buffer.get('writable_scores', {'loss'})

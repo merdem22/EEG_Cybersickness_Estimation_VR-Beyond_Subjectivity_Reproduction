@@ -13,6 +13,7 @@ class Callback:
 class AverageScoreLogger(Callback):
     """Logs selected keys from logs (or all numeric keys if none provided)."""
     def __init__(self, *score_names: str, level: int = 20):
+        # Accepts varargs of score names + optional 'level' kw (e.g., AverageScoreLogger('l1_loss','lr', level=20))
         self.score_names = list(score_names)
         self.level = level
 
@@ -23,9 +24,10 @@ class AverageScoreLogger(Callback):
             logger.log(self.level, msg)
 
     def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None, logger=None, **kwargs):
-        if not logs: 
+        if not logs:
             return
-        items = [(k, logs[k]) for k in (self.score_names or logs.keys()) if isinstance(logs.get(k), (int, float, float))]
+        keys = self.score_names or [k for k, v in logs.items() if isinstance(v, (int, float))]
+        items = [(k, logs[k]) for k in keys if k in logs and isinstance(logs[k], (int, float))]
         if not items:
             return
         msg = " | ".join([f"{k}: {v:.6f}" for k, v in items])
@@ -34,19 +36,59 @@ class AverageScoreLogger(Callback):
     def on_predict_end(self, logs: Optional[Dict[str, Any]] = None, logger=None, **kwargs):
         if not logs:
             return
-        items = [(k, logs[k]) for k in (self.score_names or logs.keys()) if isinstance(logs.get(k), (int, float, float))]
+        keys = self.score_names or [k for k, v in logs.items() if isinstance(v, (int, float))]
+        items = [(k, logs[k]) for k in keys if k in logs and isinstance(logs[k], (int, float))]
         if not items:
             return
         msg = " | ".join([f"{k}: {v:.6f}" for k, v in items])
         self._emit(logger, f"Predict: {msg}")
 
 class EarlyStopping(Callback):
-    def __init__(self, monitor: str = 'val_loss', mode: str = 'min', patience: int = 5, min_delta: float = 0.0):
-        assert mode in {'min','max'}
+    """Early stopping with flexible args.
+
+    Compatible with either:
+      EarlyStopping(monitor='val_loss', mode='min', patience=5, min_delta=0.0)
+      EarlyStopping(monitor='l1_loss', goal='minimize', patience=15, delta=1e-4, verbose=30)
+
+    Parameters
+    ----------
+    monitor : str
+        Key in `logs` to monitor.
+    mode : {'min','max'}, optional
+        Direction for improvement. If omitted and `goal` is provided, inferred from it.
+    goal : {'minimize','maximize'}, optional
+        Alternative to `mode`; strings starting with 'min' or 'max' are accepted.
+    patience : int
+        Epochs to wait for improvement before stopping.
+    min_delta / delta : float
+        Minimum change to qualify as an improvement.
+    verbose : int
+        Logging level to use when printing the stop message (e.g., 30 for WARNING).
+    """
+    def __init__(self, monitor: str = 'val_loss', mode: str = None, goal: str = None,
+                 patience: int = 5, min_delta: float = None, delta: float = None,
+                 verbose: int = 0):
         self.monitor = monitor
+        # Normalize mode/goal
+        if goal is not None and mode is None:
+            mode = 'min' if str(goal).lower().startswith('min') else 'max'
+        if mode is None:
+            mode = 'min'
+        if mode not in {'min', 'max'}:
+            raise ValueError("EarlyStopping: mode must be 'min' or 'max'")
         self.mode = mode
+        # Normalize delta/min_delta
+        if min_delta is None and delta is not None:
+            min_delta = float(delta)
+        self.min_delta = 0.0 if min_delta is None else float(min_delta)
         self.patience = int(patience)
-        self.min_delta = float(min_delta)
+        self.best = None
+        self.wait = 0
+        self.stopped_epoch = None
+        # Use provided verbose as logging level; default to INFO(20) if 0
+        self._log_level = int(verbose) if verbose and int(verbose) > 0 else 20
+
+    def on_train_begin(self, **kwargs):
         self.best = None
         self.wait = 0
         self.stopped_epoch = None
@@ -59,7 +101,7 @@ class EarlyStopping(Callback):
         else:
             return (current - best) > self.min_delta
 
-    def on_epoch_end(self, epoch: int, logs=None, trainer=None, **kwargs):
+    def on_epoch_end(self, epoch: int, logs=None, trainer=None, logger=None, **kwargs):
         if not logs or self.monitor not in logs:
             return False
         current = logs[self.monitor]
@@ -70,7 +112,8 @@ class EarlyStopping(Callback):
         self.wait += 1
         if self.wait >= self.patience:
             self.stopped_epoch = epoch
-            if trainer and getattr(trainer, 'logger', None):
-                trainer.logger.info(f"Early stopping at epoch {epoch} (best {self.monitor}={self.best:.6f})")
+            if logger is not None:
+                logger.log(self._log_level, f"Early stopping at epoch {epoch} "
+                                            f"(best {self.monitor}={self.best:.6f})")
             return True
         return False
