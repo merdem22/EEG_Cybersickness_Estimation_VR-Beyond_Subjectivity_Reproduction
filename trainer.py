@@ -1,266 +1,131 @@
-# trainer.py
+# trainer.py — article metrics only: MAE, MSE, Accuracy
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Iterable, Optional
-
+from typing import Dict, Any
 from torchutils.models import TrainerModel
 
-
 def _as_tensor_like(x, ref: torch.Tensor) -> torch.Tensor:
-    """Convert x to a tensor on the same device/dtype as ref."""
     if isinstance(x, torch.Tensor):
         t = x
-        if t.device != ref.device:
-            t = t.to(ref.device)
-        if t.dtype != ref.dtype:
-            t = t.to(ref.dtype)
+        if t.device != ref.device: t = t.to(ref.device)
+        if t.dtype  != ref.dtype:  t = t.to(ref.dtype)
         return t
     return torch.as_tensor(x, device=ref.device, dtype=ref.dtype)
 
-
 def _to_vector(t: torch.Tensor, length: int) -> torch.Tensor:
-    """
-    Coerce tensor t to a contiguous 1D tensor of size==length.
-    Common shape fixes: (B,1) -> (B,), scalar -> repeat, etc.
-    """
-    if t.ndim == 0:
-        t = t.view(1)
-    if t.ndim == 2 and t.size(1) == 1:
-        t = t[:, 0]
+    if t.ndim == 0: t = t.view(1)
+    if t.ndim == 2 and t.size(1) == 1: t = t[:, 0]
     t = t.view(-1)
-    if t.numel() == 1 and length != 1:
-        t = t.repeat(length)
-    if t.numel() != length:
-        t = t[:length]
+    if t.numel() == 1 and length != 1: t = t.repeat(length)
+    if t.numel() != length: t = t[:length]
     return t.contiguous()
 
+def _dilate_bin_1d(x: torch.Tensor, radius: int) -> torch.Tensor:
+    """Binary dilation via max-pool over a 1D window of size (2r+1). x: (N,) in {0,1}."""
+    if radius <= 0:
+        return x
+    x3 = x.view(1, 1, -1)
+    k  = 2 * radius + 1
+    y  = F.max_pool1d(x3, kernel_size=k, stride=1, padding=radius)
+    return y.view(-1)
 
 class MyTrainerModel(TrainerModel):
     """
-    Thin wrapper around the registered network that:
-      - standardizes batch → (preds, targets)
-      - returns a scalar loss on forward (for backprop)
-      - aggregates additional metrics for logging
-      - provides eval/predict step with metric aggregation
+    Wrapper around the registered network that returns a scalar loss during training
+    and logs exactly the paper’s metrics on eval/predict:
+      - MAE
+      - MSE
+      - Accuracy (binary above threshold with optional neighborhood dilation)
     """
-
     def __init__(self, train_joy_mean: float, input_type: str, task: str, **kwds):
-        # choose which metric-compute fn to use and which scores we intend to log
-        if task == 'regression':
-            compute_fn = self.compute_regression
-            writable_scores = {
-                'mse_loss',
-                'mean/l1_loss', 'mean/mse_loss',
-                'leaky-acc@0.05', 'mean/leaky-acc@0.05',
-                'leaky-acc@0.10', 'mean/leaky-acc@0.10',
-                'leaky-acc@0.20', 'mean/leaky-acc@0.20',
-            }
-            joy_mean = float(train_joy_mean)
-        elif task == 'classification':
-            compute_fn = self.compute_classification
-            writable_scores = {
-                'accuracy@non-sick', 'accuracy@sick', 'accuracy@sick-5', 'f1_score',
-                'mean/accuracy@non-sick', 'mean/accuracy@sick', 'mean/accuracy@sick-5', 'mean/f1_score',
-            }
-            joy_mean = 0.0
-        else:
-            raise ValueError(f"Unsupported task: {task}")
+        if task != 'regression':
+            raise ValueError("This runner is configured for the paper's regression setup only.")
 
-        # let the base class build the network/optimizer/etc.
+        # Metric knobs (defaults: threshold=0.10, neighborhood radius=0)
+        acc_tau = float(kwds.pop('acc_threshold', 0.10))
+        acc_rad = int(kwds.pop('acc_neighborhood', 0))
+
+        writable_scores = {'MAE', 'MSE', 'Accuracy'}
         super().__init__(**kwds, writable_scores=writable_scores)
 
-        # remember a few things for later
         self.task = task
         self.input_type = input_type
+        self._buffer['mean'] = float(train_joy_mean)    # not used in metrics, kept for completeness
+        self._buffer['acc/tau'] = acc_tau               # binary threshold (e.g., 0.10 ≈ “1 degree” if scaled)
+        self._buffer['acc/rad'] = acc_rad               # dilation radius in windows (0 = none)
 
-        # baseline stats + fn selection
-        self._buffer['mean'] = joy_mean
-        self._buffer['compute_fn'] = compute_fn
-
-        # expose getter_keys for legacy repo code (not strictly required here)
-        self._buffer['getter_keys'] = ('eeg', 'psd', 'kinematic') if input_type == 'multi-segment' else ('kinematic',)
-
-        # track lr across steps if trainer wants it
-        try:
-            from torchutils.metrics import AverageScore
-            self._buffer['lr'] = AverageScore(name='lr')
-        except Exception:
-            pass
-
-        # if task is regression and criterion is L1/MSE etc., we keep shapes aligned in .forward
-        # and do NOT wrap criterion with .flatten() here (we handle shapes explicitly).
-
-    # -------------------------
-    # Core batch handling
-    # -------------------------
+    # ---------- batch utils ----------
     def model_output(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """
-        Forward the underlying network. We pass every item except 'observation'
-        as kwargs; networks are written to accept only the keys they need.
-        """
         kwargs = {k: v for k, v in batch.items() if k != 'observation'}
         return self.model(**kwargs)
 
     def _extract_preds_targets(self, batch: Dict[str, Any]) -> (torch.Tensor, torch.Tensor):
-        """Get predictions and targets as 1D tensors of length B."""
-        preds = self.model_output(batch)  # (B, 1) or (B,)
+        preds = self.model_output(batch)
         if isinstance(preds, torch.Tensor) and preds.ndim > 1 and preds.size(-1) == 1:
             preds = preds.squeeze(-1)
-
-        # Ensure targets are a tensor on same device/dtype and 1D of length B
-        targets = batch['observation']
-        targets = _as_tensor_like(targets, preds)
+        targets = _as_tensor_like(batch['observation'], preds)
         targets = _to_vector(targets, length=preds.shape[0])
-
-        # Force preds to 1D vector as well
-        preds = _to_vector(preds, length=preds.shape[0])
+        preds   = _to_vector(preds,   length=preds.shape[0])
         return preds, targets
 
-    # -------------------------
-    # Training/Eval entrypoints
-    # -------------------------
+    # ---------- training / eval ----------
     def forward(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """
-        TRAIN step:
-          - compute preds/targets
-          - compute scalar loss
-          - update running loss tracker for epoch logs
-          - return loss tensor for backprop
-        """
         preds, targets = self._extract_preds_targets(batch)
         loss = self.criterion(preds, targets)
-
-        # Update the running loss aggregator used by the Trainer for epoch logs.
         try:
             self._loss.update(float(loss.item()), n=int(preds.numel()))
         except Exception:
             pass
-
-        # cache for trainer fallbacks (e.g., when forward returns non-tensor in some models)
         self._last_loss = loss
         return loss
 
     @torch.no_grad()
     def forward_pass_on_evauluation_step(self, batch: Dict[str, Any]):
-        """
-        EVAL/PREDICT step:
-          - compute preds/targets
-          - update _loss for validation/predict logs
-          - compute and log metrics via the selected compute_fn
-          - optionally dump a small sample to logger for debugging
-        """
         preds, targets = self._extract_preds_targets(batch)
-
-        # Update validation/predict loss aggregator
+        # Update loss tracker so epoch/predict logs have a number
         try:
             ev_loss = self.criterion(preds, targets)
             self._loss.update(float(ev_loss.item()), n=int(preds.numel()))
         except Exception:
             pass
 
-        # Metric bookkeeping
-        cf = self._buffer.get('compute_fn', None)
-        if callable(cf):
-            cf(preds, targets)
+        # Log exactly the paper metrics
+        self._log_paper_metrics(preds, targets)
 
-        # Optional: dump a small slice for visibility
-        if getattr(self, 'task', 'regression') == 'regression' and getattr(self, '_logger', None):
-            out_list = preds.detach().flatten().tolist()[:32]
-            tgt_list = targets.detach().flatten().tolist()[:32]
-            self._logger.info(f"REGRESSION_OUTPUT: {out_list}")
-            self._logger.info(f"REGRESSION_TARGET: {tgt_list}")
-
+        # Optional peeks
+        if getattr(self, '_logger', None):
+            self._logger.info(f"REGRESSION_OUTPUT: {preds.detach().flatten().tolist()[:32]}")
+            self._logger.info(f"REGRESSION_TARGET: {targets.detach().flatten().tolist()[:32]}")
         return preds
 
-    # -------------------------
-    # Metric helpers
-    # -------------------------
+    # ---------- metrics ----------
+    @torch.no_grad()
+    def _log_paper_metrics(self, preds: torch.Tensor, targets: torch.Tensor):
+        preds = preds.view(-1); targets = targets.view(-1)
+        # MAE, MSE
+        mae = torch.mean(torch.abs(preds - targets)).item()
+        mse = F.mse_loss(preds, targets).item()
+        # Accuracy: binarize and optional neighborhood dilation
+        tau = float(self._buffer.get('acc/tau', 0.10))
+        rad = int(self._buffer.get('acc/rad', 0))
+        gt_bin = (targets > tau).float()
+        pr_bin = (preds   > tau).float()
+        if rad > 0:
+            gt_bin = _dilate_bin_1d(gt_bin, rad)
+            pr_bin = _dilate_bin_1d(pr_bin, rad)
+        TP = ((pr_bin == 1) & (gt_bin == 1)).sum().item()
+        TN = ((pr_bin == 0) & (gt_bin == 0)).sum().item()
+        FP = ((pr_bin == 1) & (gt_bin == 0)).sum().item()
+        FN = ((pr_bin == 0) & (gt_bin == 1)).sum().item()
+        acc = (TP + TN) / max(TP + TN + FP + FN, 1e-8) * 100.0
+
+        self.log_score('MAE', mae)
+        self.log_score('MSE', mse)
+        self.log_score('Accuracy', acc)
+
+    # expose base helpers (unchanged)
     def log_score(self, name: str, value: float, n: int = 1):
-        """Proxy to base-class aggregator."""
         super().log_score(name, value, n=n)
 
     def reset_scores(self):
         super().reset_scores()
-
-    # -------------------------
-    # Metrics for tasks
-    # -------------------------
-    @torch.no_grad()
-    def compute_regression(self, preds: torch.Tensor, targets: torch.Tensor):
-        """
-        Log a few regression metrics:
-          - mse_loss on (preds, targets)
-          - baseline losses vs constant mean
-          - tolerance accuracies at 0.05 / 0.10 / 0.20
-        """
-        preds = preds.view(-1)
-        targets = targets.view(-1)
-
-        # main regression metrics
-        self.log_score('mse_loss', F.mse_loss(preds, targets).item())
-
-        mean_val = float(self._buffer.get('mean', 0.0))
-        means = torch.full_like(preds, mean_val)
-        self.log_score('mean/l1_loss', F.l1_loss(means, targets).item())
-        self.log_score('mean/mse_loss', F.mse_loss(means, targets).item())
-
-        # tolerance accuracies
-        err = (preds - targets).abs()
-        err_mean = (means - targets).abs()
-        for tau in (0.05, 0.10, 0.20):
-            self.log_score(f'leaky-acc@{tau:.2f}', (err <= tau).float().mean().item())
-            self.log_score(f'mean/leaky-acc@{tau:.2f}', (err_mean <= tau).float().mean().item())
-
-    @torch.no_grad()
-    def compute_classification(self, preds: torch.Tensor, targets: torch.Tensor):
-        """
-        Example classification metrics (if you ever switch tasks):
-          - per-class accuracy variants and F1.
-        Assumes preds are logits or probabilities for binary classification.
-        """
-        preds = preds.view(-1)
-        targets = targets.view(-1).float()
-
-        # If preds look like logits, sigmoid them
-        if preds.min() < 0 or preds.max() > 1:
-            probs = preds.sigmoid()
-        else:
-            probs = preds.clamp(0, 1)
-
-        y_hat = (probs >= 0.5).float()
-        y = targets
-
-        # avoid 0/0 with eps
-        eps = 1e-8
-        TP = (y_hat * y).sum().item()
-        TN = ((1 - y_hat) * (1 - y)).sum().item()
-        FP = (y_hat * (1 - y)).sum().item()
-        FN = ((1 - y_hat) * y).sum().item()
-
-        acc_sick = TP / max(TP + FN, eps)
-        acc_non = TN / max(TN + FP, eps)
-        prec = TP / max(TP + FP, eps)
-        rec = TP / max(TP + FN, eps)
-        f1 = (2 * prec * rec) / max(prec + rec, eps)
-
-        self.log_score('accuracy@sick', float(acc_sick))
-        self.log_score('accuracy@non-sick', float(acc_non))
-        self.log_score('f1_score', float(f1))
-
-        # (Optional) comparison to mean predictor (always-majority class)
-        p_mean = (y.mean().item() >= 0.5)  # predict-1 if majority positives
-        y_mean = torch.full_like(y, float(p_mean))
-        TPm = (y_mean * y).sum().item()
-        TNm = ((1 - y_mean) * (1 - y)).sum().item()
-        FPm = (y_mean * (1 - y)).sum().item()
-        FNm = ((1 - y_mean) * y).sum().item()
-        acc_sick_m = TPm / max(TPm + FNm, eps)
-        acc_non_m = TNm / max(TNm + FPm, eps)
-        prec_m = TPm / max(TPm + FPm, eps)
-        rec_m = TPm / max(TPm + FNm, eps)
-        f1_m = (2 * prec_m * rec_m) / max(prec_m + rec_m, eps)
-
-        self.log_score('mean/accuracy@sick', float(acc_sick_m))
-        self.log_score('mean/accuracy@non-sick', float(acc_non_m))
-        self.log_score('mean/f1_score', float(f1_m))
