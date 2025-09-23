@@ -51,8 +51,9 @@ if __name__ == '__main__':
     params.patient = f'{params.patient:04d}'
     set_seed(params.seed)
 
-    train_dataset, valid_dataset, test_datasets = loader.load_train_test_datasets(patient=params.patient, input_type=params.input_type, task=params.task, validation=True)
-    device='cpu' if params.no_cuda else 'cuda'
+    device = 'cpu' if params.no_cuda else 'cuda'
+    train_dataset, valid_dataset, test_datasets = loader.load_train_test_datasets(patient=params.patient, input_type=params.input_type, task=params.task, validation=True, device=device)
+
 
     net = MyTrainerModel(
         model=f'{params.input_type}-model',

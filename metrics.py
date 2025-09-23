@@ -1,4 +1,50 @@
+#accuracy utilities
+
 import numpy as np
+from typing import Tuple
+
+def _dilate_1d_binary(x: np.ndarray, radius: int) -> np.ndarray:
+    """
+    Simple 1D binary dilation by a flat window of size (2*radius+1).
+    """
+    x = np.asarray(x).astype(np.uint8).reshape(-1)
+    if radius <= 0:
+        return x
+    k = 2 * radius + 1
+    pad = np.pad(x, (radius, radius), mode="edge")
+    out = np.empty_like(x)
+    for i in range(len(x)):
+        out[i] = pad[i:i+k].max()
+    return out
+
+def binary_accuracy_with_neighborhood(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    threshold: float = 0.10,
+    radius: int = 0
+) -> Tuple[float, Tuple[int, int, int, int]]:
+    """
+    Paper Acc (%): threshold both signals at `threshold`, optionally dilate by `radius`,
+    then Acc = (TP + TN) / (TP + TN + FP + FN) * 100.
+    Returns (acc_percent, (TP, TN, FP, FN)).
+    """
+    p = np.asarray(preds).reshape(-1)
+    t = np.asarray(targets).reshape(-1)
+    p_bin = (p > threshold).astype(np.uint8)
+    t_bin = (t > threshold).astype(np.uint8)
+
+    if radius > 0:
+        p_bin = _dilate_1d_binary(p_bin, radius)
+        t_bin = _dilate_1d_binary(t_bin, radius)
+
+    TP = int(((p_bin == 1) & (t_bin == 1)).sum())
+    TN = int(((p_bin == 0) & (t_bin == 0)).sum())
+    FP = int(((p_bin == 1) & (t_bin == 0)).sum())
+    FN = int(((p_bin == 0) & (t_bin == 1)).sum())
+    denom = TP + TN + FP + FN
+    acc = 100.0 * (TP + TN) / denom if denom else 0.0
+    return acc, (TP, TN, FP, FN)
+
 
 
 def leaky_accuracy(y_pred, y_true, span=3, threshold=0.05):

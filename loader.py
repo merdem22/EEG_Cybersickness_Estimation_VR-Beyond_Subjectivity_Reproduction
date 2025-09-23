@@ -19,11 +19,14 @@ class Windows(d.Dataset):
         return np.expand_dims(self.windows[index].transpose(), 0)
 
 class Dataset(d.Dataset):
-    def __init__(self, train_mean=None, **args):
+    def __init__(self, train_mean=None, device='cpu', **args):
         super().__init__()
         self.args = args
         self.train_mean = train_mean
-        self.map = lambda x: torch.from_numpy(x).cuda()
+        if device == 'cpu':
+            self.map = lambda x: torch.from_numpy(x)
+        else:
+            self.map = lambda x: torch.from_numpy(x).cuda()
 
     def __len__(self):
         return len(next(iter(self.args.values())))
@@ -40,7 +43,7 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
-def load_train_test_datasets(prefix='datasets/.cache', patient='0001', task='regression', input_type='power-spectral-no-kinematic', validation=False):
+def load_train_test_datasets(prefix='datasets/.cache', patient='0001', task='regression', input_type='power-spectral-no-kinematic', validation=False, device='cpu'):
     assert isinstance(task, str) and task in ['classification', 'regression']
     assert isinstance(input_type, str) #and input_type in ['multi-segment', 'kinematic', 'power-spectral-coeff', 'power-spectral-difference']
     assert isinstance(patient, str) and len(patient) == 4
@@ -177,4 +180,4 @@ def load_train_test_datasets(prefix='datasets/.cache', patient='0001', task='reg
         splitted_items = train_test_split(*map(train_dataset.__getitem__, keys), shuffle=True, test_size=0.1, random_state=42)
         return Dataset(**dict(zip(keys, splitted_items[::2]))), Dataset(**dict(zip(keys, splitted_items[1::2]))), test_datasets
     
-    return Dataset(**train_dataset), test_datasets, 
+    return Dataset(device=device, **train_dataset), test_datasets,
